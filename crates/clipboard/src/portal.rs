@@ -66,7 +66,62 @@ async fn retrieve_async(key: &str) -> Result<Vec<PathBuf>, String> {
         .await
         .map_err(|error| error.to_string())?;
     let paths = reply.body().deserialize::<Vec<String>>().map_err(|error| error.to_string())?;
-    validate(paths)
+    let paths = validate(paths)?;
+    if std::env::var_os("FLATPAK_ID").is_some_and(|id| !id.is_empty())
+        && let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from).filter(|path| path.is_absolute())
+    {
+        // Flatpak mounts permitted documents in its own runtime/doc. Private desktop sessions
+        // can use another host mount, so translate that prefix without granting filesystem access.
+        if let Ok(reply) = connection
+            .call_method(
+                Some("org.freedesktop.portal.Documents"),
+                "/org/freedesktop/portal/documents",
+                Some("org.freedesktop.portal.Documents"),
+                "GetMountPoint",
+                &(),
+            )
+            .await
+            && let Ok(mut bytes) = reply.body().deserialize::<Vec<u8>>()
+        {
+            if bytes.last() == Some(&0) {
+                bytes.pop();
+            }
+            use std::os::unix::ffi::OsStringExt;
+            let host = PathBuf::from(std::ffi::OsString::from_vec(bytes));
+            return Ok(sandbox_paths(paths, &host, &runtime));
+        }
+    }
+    Ok(paths)
+}
+fn sandbox_paths(paths: Vec<PathBuf>, host_mount: &std::path::Path, runtime: &std::path::Path) -> Vec<PathBuf> {
+    if !host_mount.is_absolute() || host_mount.parent().is_none() {
+        return paths;
+    }
+    // Preflight the full set before allocating, retaining the portal's limits after remapping.
+    let total = paths.iter().try_fold(0usize, |total, path| {
+        let bytes = match path.strip_prefix(host_mount) {
+            Ok(relative) if !relative.components().any(|component| component == std::path::Component::ParentDir) => {
+                runtime.as_os_str().len().checked_add(5)?.checked_add(relative.as_os_str().len())?
+            }
+            _ => path.as_os_str().len(),
+        };
+        if bytes > 65536 {
+            return None;
+        }
+        total.checked_add(bytes).filter(|total| *total <= 16 << 20)
+    });
+    if total.is_none() {
+        return paths;
+    }
+    paths
+        .into_iter()
+        .map(|path| match path.strip_prefix(host_mount) {
+            Ok(relative) if !relative.components().any(|component| component == std::path::Component::ParentDir) => {
+                runtime.join("doc").join(relative)
+            }
+            _ => path,
+        })
+        .collect()
 }
 fn validate(paths: Vec<String>) -> Result<Vec<PathBuf>, String> {
     if paths.len() > 4096 {
@@ -86,6 +141,17 @@ fn validate(paths: Vec<String>) -> Result<Vec<PathBuf>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn sandbox_paths_map_only_the_document_mount() {
+        let paths = vec![PathBuf::from("/private/runtime/doc/12/β.txt"), PathBuf::from("/shared/file.txt")];
+        assert_eq!(
+            sandbox_paths(paths, std::path::Path::new("/private/runtime/doc"), std::path::Path::new("/run/user/1002")),
+            vec![PathBuf::from("/run/user/1002/doc/12/β.txt"), PathBuf::from("/shared/file.txt")]
+        );
+        let hostile = vec![PathBuf::from("/private/runtime/doc/../outside")];
+        assert_eq!(sandbox_paths(hostile.clone(), std::path::Path::new("/private/runtime/doc"), std::path::Path::new("/run/user/1002")), hostile);
+    }
+
     #[test]
     fn clipboard_keys_reject_malformed_or_unbounded_data() {
         assert_eq!(file_transfer_key(b"transfer-key\0"), Ok("transfer-key"));
