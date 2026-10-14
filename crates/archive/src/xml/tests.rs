@@ -141,6 +141,70 @@ fn a_comment_inside_a_declaration_does_not_end_it() {
 
 #[test]
 fn only_the_doctype_is_looked_for_outside_markup() {
+    // (kept from the original suite; see the element-name tests below for the boundary they pin)
+    assert!(xml::check(b"<ADOCTYPE/>", &limits(1, Dtd::Refuse)).is_ok());
+    // An element whose *name* contains the keyword is an element, never a declaration: the
+    // scan must require `<!` before the keyword, or such elements could bypass the depth cap
+    // under `DeclarationOnly` and be falsely refused under `Refuse`.
+    let nested = b"<aDOCTYPE><aDOCTYPE><aDOCTYPE/></aDOCTYPE></aDOCTYPE>";
+    assert_eq!(
+        xml::check(nested, &limits(1, Dtd::DeclarationOnly)),
+        Err(Error::TooDeep { depth: 2, limit: 1 }),
+        "an element named `aDOCTYPE` is an element: depth 3 must be refused"
+    );
+    assert!(xml::check(nested, &limits(3, Dtd::DeclarationOnly)).is_ok());
+    assert!(xml::check(nested, &limits(3, Dtd::Refuse)).is_ok(), "under Refuse the document is still ordinary elements, not a declaration");
+}
+
+#[test]
+fn a_processing_instruction_inside_a_subset_cannot_end_its_scan_early() {
+    // A `]` inside a DTD processing instruction used to close the apparent subset, ending its
+    // measurement early so the rest of the subset was never charged against the cap.
+    let text = b"<!DOCTYPE r [<?p ]?> <!ENTITY e \"xxxxxxxxxxxxxxxx\">]><r/>";
+    assert_eq!(
+        xml::check(text, &limits(8, Dtd::InternalSubset { max_bytes: 4 })),
+        Err(Error::InternalSubsetTooLarge { actual: 38, limit: 4 }),
+        "the PI is part of the subset; everything up to the real `]` is charged"
+    );
+    // With a cap that admits it, the same document passes.
+    assert!(xml::check(text, &limits(8, Dtd::InternalSubset { max_bytes: 100 })).is_ok());
+    // Brackets and quotes inside a DTD PI are ordinary subset bytes, not structure.
+    let hostile = b"<!DOCTYPE r [<?p [ \" ?>]><r/>";
+    assert_eq!(xml::check(hostile, &limits(8, Dtd::InternalSubset { max_bytes: 3 })), Err(Error::InternalSubsetTooLarge { actual: 10, limit: 3 }));
+    // A comment inside the subset keeps its existing semantics (skipped for structure, but
+    // part of the subset for the byte cap) — pin it beside the PI case.
+    let with_comment = b"<!DOCTYPE r [<!-- ] -->]><r/>";
+    assert!(xml::check(with_comment, &limits(8, Dtd::InternalSubset { max_bytes: 200 })).is_ok());
+}
+
+#[test]
+fn a_utf16_document_is_refused_rather_than_silently_admitted() {
+    // `check` reads raw bytes; a UTF-16 document's markup is not contiguous ASCII, so the scan
+    // would see no tags at all and admit a DTD the policy refuses. The scan must detect the
+    // BOM and refuse: the caller must decode to UTF-8 first.
+    let text = "<!DOCTYPE r [<!ENTITY e 'x'>]><r>&e;</r>";
+    let mut utf16le = vec![0xFF, 0xFE];
+    for unit in text.encode_utf16() {
+        utf16le.extend_from_slice(&unit.to_le_bytes());
+    }
+    assert_eq!(xml::check(&utf16le, &limits(10, Dtd::Refuse)), Err(Error::UnsupportedEncoding));
+    // The same document as UTF-8 (no BOM) is checked normally.
+    assert!(xml::check(text.as_bytes(), &limits(10, Dtd::Refuse)).is_err());
+    assert!(xml::check(text.as_bytes(), &limits(10, Dtd::InternalSubset { max_bytes: 100 })).is_ok());
+    // UTF-16BE with BOM is refused the same way.
+    let mut utf16be = vec![0xFE, 0xFF];
+    for unit in text.encode_utf16() {
+        utf16be.extend_from_slice(&unit.to_be_bytes());
+    }
+    assert_eq!(xml::check(&utf16be, &limits(10, Dtd::Refuse)), Err(Error::UnsupportedEncoding));
+    // UTF-8 with its BOM is the same bytes as without it.
+    let mut utf8_bom = vec![0xEF, 0xBB, 0xBF];
+    utf8_bom.extend_from_slice(text.as_bytes());
+    assert!(xml::check(&utf8_bom, &limits(10, Dtd::InternalSubset { max_bytes: 100 })).is_ok());
+}
+
+#[test]
+fn text_and_attribute_values_mentioning_doctype_are_not_declarations() {
     // Text and attribute values mentioning DOCTYPE are not declarations.
     let text = b"<r note=\"&lt;!DOCTYPE x&gt;\">a &lt;!DOCTYPE y&gt; b</r>";
     assert!(xml::check(text, &limits(4, Dtd::Refuse)).is_ok());

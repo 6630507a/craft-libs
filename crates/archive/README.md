@@ -72,6 +72,10 @@ Comments, CDATA sections, processing instructions and quoted attribute values ca
 `InternalSubset { max_bytes }`. `xml::Depth` is the same counter for a reader that counts as it
 parses, so both agree on where the limit is.
 
+**`xml::check` reads UTF-8 bytes.** A document in any other encoding (a UTF-16 BOM is the tell) is
+refused with `Error::UnsupportedEncoding` rather than silently admitted: decode to UTF-8 first and
+check those bytes — the same bytes the downstream parser reads.
+
 ## What stays in the applications
 
 Every number, and which parts are read or skipped. Entry-name rules and part allowlists. Whether a

@@ -11,6 +11,10 @@
 //! anything malformed simply ends the scan (the parser reports the malformed document afterwards).
 //! It never recurses, never allocates and never panics.
 //!
+//! **The input must be UTF-8.** The scan reads raw bytes; a document in another encoding (a UTF-16
+//! BOM is the tell) is refused with [`Error::UnsupportedEncoding`] rather than silently admitted.
+//! Decode first and check the same bytes the downstream parser reads.
+//!
 //! Markup inside an entity declaration is *not* counted against the nesting limit, so an
 //! application that admits an internal subset should bound its size ([`Dtd::InternalSubset`]) and
 //! still set its parser's own node limit: expansion happens where the entity is referenced.
@@ -65,6 +69,10 @@ pub enum Error {
         /// The caller's limit.
         limit: u64,
     },
+    /// The document is not UTF-8: the scan reads raw bytes, so it cannot check a document whose
+    /// markup is not contiguous ASCII (a UTF-16 BOM is the tell). The caller must decode to
+    /// UTF-8 first and check the decoded bytes — the same bytes the downstream parser reads.
+    UnsupportedEncoding,
 }
 
 impl fmt::Display for Error {
@@ -74,6 +82,7 @@ impl fmt::Display for Error {
             Self::DtdRefused => f.write_str("a document type declaration is not allowed"),
             Self::InternalSubsetNotAllowed => f.write_str("a document type declaration with an internal subset is not allowed"),
             Self::InternalSubsetTooLarge { actual, limit } => write!(f, "the internal subset is {actual} bytes; the limit is {limit}"),
+            Self::UnsupportedEncoding => f.write_str("the document is not UTF-8; decode it to UTF-8 before checking it"),
         }
     }
 }
@@ -132,6 +141,14 @@ impl Depth {
 /// admitted while its internal subset stays within a byte cap. An unterminated construct ends the
 /// scan; the parser that runs next reports the malformed document.
 pub fn check(text: &[u8], limits: &Limits) -> Result<(), Error> {
+    // The scan reads raw bytes and recognises only contiguous ASCII markup. A UTF-16 document
+    // (BOM: FF FE / FE FF) interleaves zero bytes, so the scan would see no tags at all and
+    // admit a DTD the policy refuses. Refuse rather than silently admit: the caller must
+    // decode to UTF-8 and check those bytes. The UTF-8 BOM (EF BB BF) is ASCII-compatible and
+    // checked normally.
+    if text.starts_with(&[0xFF, 0xFE]) || text.starts_with(&[0xFE, 0xFF]) {
+        return Err(Error::UnsupportedEncoding);
+    }
     let mut depth = Depth::new(limits.max_depth);
     let mut at = 0usize;
     while let Some(&byte) = text.get(at) {
@@ -172,10 +189,16 @@ pub fn check(text: &[u8], limits: &Limits) -> Result<(), Error> {
 
 /// Whether the markup starting at `rest` opens a document type declaration.
 ///
-/// Case is ignored so that a lower-case declaration cannot slip past the policy into a parser
-/// that recognises it.
+/// The `<!` prefix is required, not implied: an element whose *name* contains the keyword
+/// (`<aDOCTYPE>`) is an element, and treating it as a declaration would both bypass the depth
+/// cap under `DeclarationOnly` and falsely refuse the document under `Refuse`. Case is
+/// ignored so that a lower-case declaration cannot slip past the policy into a parser that
+/// recognises it.
 fn opens_doctype(rest: &[u8]) -> bool {
     const KEYWORD: &[u8] = b"DOCTYPE";
+    if !rest.starts_with(b"<!") {
+        return false;
+    }
     let Some(after_bang) = rest.get(2..) else { return false };
     let Some(keyword) = after_bang.get(..KEYWORD.len()) else { return false };
     keyword.eq_ignore_ascii_case(KEYWORD)
@@ -196,6 +219,13 @@ fn check_doctype(text: &[u8], at: usize, dtd: Dtd) -> Result<usize, Error> {
     while let Some(&byte) = text.get(index) {
         if quote.is_none() && text.get(index..).is_some_and(|rest| rest.starts_with(b"<!--")) {
             index = skip_to(text, index.saturating_add(4), b"-->");
+            continue;
+        }
+        // A processing instruction is legal inside an internal subset, so its bytes are part
+        // of the subset: skip it atomically through `?>` so a `]` or `>` inside it cannot end
+        // the apparent subset or declaration early, leaving subset bytes uncharged.
+        if quote.is_none() && text.get(index..).is_some_and(|rest| rest.starts_with(b"<?")) {
+            index = skip_to(text, index.saturating_add(2), b"?>");
             continue;
         }
         match quote {
