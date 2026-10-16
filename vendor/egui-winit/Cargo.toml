@@ -388,7 +388,7 @@ all = "warn"
 
 
 [patch.crates-io]
-winit = { git = "https://github.com/skylartaylor/winit", rev = "2732964c88457e3e4b796ac6b15ef7fb332a6aad" }
+winit = { git = "https://github.com/storytold/winit", rev = "2732964c88457e3e4b796ac6b15ef7fb332a6aad" }
 
 
 
